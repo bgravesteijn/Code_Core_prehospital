@@ -1,0 +1,1609 @@
+---
+title: "Version 2"
+author: "Benjamin Gravesteijn"
+date: "16 september 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(grid)
+library(Gmisc)
+library(tableone)
+library(lubridate)
+library(knitr)
+library(tidyr)
+library(rms)
+library(data.table)
+library(lme4)
+library(ggplot2)
+library(ggsci)
+library(mice)
+library(ordinal)
+
+load("Data/cleaned.RData")
+load("Data/Sleutellijst.rdata")
+df<-merge(df, dt.key[,c("gupi","country","center")], by="gupi")
+```
+
+#Main text 
+
+```{r exclusion}
+n <- rep(0, 3)
+##no walk-in
+n[1] <- nrow(df)
+df <- df[df$InjuryHx.PresArrivalMethod!="walk in"&
+           !is.na(df$InjuryHx.PresArrivalMethod),]
+n[2] <- nrow(df)
+
+##remove denmark (small numbers, weird times)
+df <- df[df$country!="DK",]
+n[3] <- nrow(df)
+```
+
+```{r imputing on-scene times}
+phtime <- df[,c("Subject.TimeInj", 
+                "Subject.DateInj",
+                "InjuryHx.PresFirstOnSceneDate",
+                "InjuryHx.PresFirstOnSceneTime",
+                "InjuryHx.PresFirstOnSceneDepartureDate",
+                "InjuryHx.PresFirstOnSceneDepartureTime",
+                "InjuryHx.PresSTHospTime", 
+                "InjuryHx.PresSTHospDate",
+                "InjuryHx.PresFHospDate",
+                "InjuryHx.PresFHospTime",
+                "InjuryHx.PresTBIRef",
+                "InjuryHx.PresArrivalMethod",
+                "InjuryHx.PresEmergencyCare",
+                "InjuryHx.PresEmergencyCareSuppOxygen",
+                "InjuryHx.PresCirculationTreatmentIVFluids",
+                "InjuryHx.PresEmergencyCareIntubation",
+                "Subject.Age",
+                "Subject.PatientType",
+                "Subject.Sex",
+                "InjuryHx.GCSScoreBaselineDerived",
+                "Subject.GOSE6monthEndpointDerived",
+                "Subject.SiteCode",
+                "gupi")]
+
+###############create timevariables
+phtime$t0 <- as.numeric(0)
+phtime$t1 <- as.numeric(difftime(time1 = ymd_hms(paste(phtime$InjuryHx.PresFirstOnSceneDate, 
+                                            phtime$InjuryHx.PresFirstOnSceneTime)),
+                      time2 = ymd_hms(paste(phtime$Subject.DateInj, phtime$Subject.TimeInj)),
+                      units="min"))
+phtime$t2 <- as.numeric(difftime(time1 = ymd_hms(paste(phtime$InjuryHx.PresFirstOnSceneDepartureDate, 
+                                            phtime$InjuryHx.PresFirstOnSceneDepartureTime)),
+                      time2 =ymd_hms(paste(phtime$Subject.DateInj, phtime$Subject.TimeInj)),
+                      units="min"))
+phtime$hosp_datetime <- ymd_hms(paste(phtime$InjuryHx.PresSTHospDate,
+                                                   phtime$InjuryHx.PresSTHospTime))
+phtime$hosp_datetime[phtime$InjuryHx.PresTBIRef=="secondary"&
+                       !is.na(phtime$InjuryHx.PresTBIRef)]  <- ymd_hms( paste(
+                                          phtime$InjuryHx.PresFHospDate,
+                                          phtime$InjuryHx.PresFHospTime)
+                                          [phtime$InjuryHx.PresTBIRef=="secondary"&
+                                              !is.na(phtime$InjuryHx.PresTBIRef)])
+
+phtime$t3 <- as.numeric(difftime(time1 = phtime$hosp_datetime,
+                      time2 = ymd_hms(paste(phtime$Subject.DateInj, phtime$Subject.TimeInj)),
+                      units="min"))
+phtime$hosp_datetime<-NULL
+
+phtime$t1[phtime$t1<0|phtime$t1>quantile(phtime$t1,probs=0.98, na.rm=TRUE)]<- NA
+
+phtime$t2[phtime$t2<0|phtime$t2>quantile(phtime$t2,probs=0.98, na.rm=TRUE)]<- NA
+phtime$t2[phtime$t2<phtime$t1]<-NA
+
+phtime$t3[phtime$t3<0|phtime$t3>quantile(phtime$t3,probs=0.98, na.rm=TRUE)]<- NA
+phtime$t2[phtime$t3<phtime$t2]<-NA
+
+times <- phtime[,c("gupi", "t1", "t2","t3")]
+
+observed_ost <- !is.na(times$t2-times$t1)
+
+### descriptives original times
+org_t <- phtime
+org_t$response_time <- org_t$t1
+org_t$onscene_time  <- org_t$t2-org_t$t1
+org_t$travel_time   <- org_t$t3-org_t$t2
+org_t$prehosp_time  <- org_t$t3
+timevrs <- c("response_time", "onscene_time", "travel_time", "prehosp_time")
+time_tbl <- CreateTableOne(vars = timevrs, data=org_t)
+time_tbl.p <- print(time_tbl, nonnorm=timevrs, printToggle=FALSE, missing = TRUE)
+kable(time_tbl.p)
+
+
+#####impute normal dataset
+phtime <- phtime[,-c(1:10,23,24)]
+phtime$onscene<-(phtime$t2-phtime$t1)
+phtime$onscene[phtime$onscene<1] <- 1
+phtime$t2 <- NULL
+levels(phtime$InjuryHx.PresArrivalMethod) <- c(levels(phtime$InjuryHx.PresArrivalMethod)[1:3],NA)
+phtime_i <- mice(phtime, maxit=0)
+meth <- phtime_i$method
+pred <- phtime_i$predictorMatrix
+
+pred[,"Subject.SiteCode"] <- 0
+
+phtime_i <- mice(data=phtime, m=5, method=meth, predictorMatrix = pred,
+                 seed=123, printFlag = FALSE)
+phtime_i<-cbind(phtime_i, gupi=df$gupi)
+
+####### fit model for onscenetime
+fit <- with(phtime_i, lmer(I(log(onscene))~
+                      (rcs(t3,4)+
+                      rcs(t1,4))*(
+                      InjuryHx.PresTBIRef+
+                      InjuryHx.PresArrivalMethod+
+                      InjuryHx.PresEmergencyCare+
+                      InjuryHx.PresEmergencyCareSuppOxygen+
+                      InjuryHx.PresCirculationTreatmentIVFluids+
+                      InjuryHx.PresEmergencyCareIntubation)+
+                      rcs(Subject.Age,4)+
+                      Subject.PatientType+
+                      Subject.Sex+
+                      InjuryHx.GCSScoreBaselineDerived+
+                      I(factor(Subject.GOSE6monthEndpointDerived))+
+                      (1|Subject.SiteCode)))
+pred <- exp(apply(sapply(fit$analyses, predict), 1, mean)) #get predictions
+
+#the predictions and observations for the patients with an observed on scene time 
+#we will see how reliable our predictions are
+plot.df <- data.frame(pred=pred[!is.na(phtime$onscene)],
+                      obs = phtime$onscene[!is.na(phtime$onscene)],
+                      site = phtime$Subject.SiteCode[!is.na(phtime$onscene)],
+                      gupi= complete(phtime_i)$gupi[!is.na(phtime$onscene)])
+plot.df$diff <- plot.df$pred-plot.df$obs
+
+
+fit_onscene_cal <-lm(obs~pred, 
+                     data=plot.df[plot.df$obs<100&plot.df$pred<100,]) #calibration in the 100 min range
+# summary(fit_onscene_cal)
+
+fit_onscene_cal2 <-lm(obs~pred, 
+                     data=plot.df[plot.df$obs<20&plot.df$pred<20,]) #calibration in the 20 min range
+# summary(fit_onscene_cal2)
+
+r2<-sprintf("%.2f",summary(fit_onscene_cal)$r.squared)
+
+plot.cal_ost_impute<-ggplot(plot.df[plot.df$obs<100&
+                 plot.df$pred<100,], 
+                 aes(x=pred,y=obs))+
+  geom_point()+
+  xlab("Predicted time")+
+  ylab("Observed time")+
+  geom_abline(slope = 1, intercept = 0,lty=2)+
+  annotate("text", x = 20, y=90, label=paste("R-squared =", r2))+
+  theme_bw()
+
+
+df$onscene_t <- ifelse(is.na(phtime$onscene),pred,phtime$onscene) #use observed values, otherwise predicted
+###make > 100 missinG
+df$onscene_t[df$onscene_t>100] <- NA
+##if self-present, make missing:
+df$onscene_t<- ifelse(df$InjuryHx.PresArrivalMethod=="walk in",NA,df$onscene_t)
+
+```
+
+## Table 1
+
+```{r, baseline table}
+###sarsap variable
+df$sarsap <- ifelse(df$onscene_t>20, ">20 min",
+                           "<20 min")
+df$sarsap<-factor(df$sarsap, levels=c("<20 min", ">20 min"))
+
+### mei variable
+abdo_ais <- sqrt(df$InjuryHx.BestOfAbdomenPelvicLumbarISS)
+face_ais <- sqrt(df$InjuryHx.BestOfFaceISS)
+thor_ais <- sqrt(df$InjuryHx.BestOfChestSpineISS)
+exte_ais <- sqrt(df$InjuryHx.BestOfExternaISS)
+limb_ais <- sqrt(df$InjuryHx.BestOfExtremitiesISS)
+
+mei <- ifelse(abdo_ais>3|
+                face_ais>3|
+                thor_ais>3|
+                exte_ais>3|
+                limb_ais>3, 1,0)
+df$MEI <- factor(mei)
+
+df$response.time <- phtime$t1
+df$prehosp.time  <- phtime$t3
+
+########tableone
+stratvar <- "sarsap"
+vars     <- c("Subject.Age","Subject.Sex", "MEI",
+              "InjuryHx.InjCause", "InjuryHx.InjType",
+              "InjuryHx.InjArea", "InjuryHx.InjPlace", 
+              "InjuryHx.PresEmergencyCare", "InjuryHx.PresTBIRef","InjuryHx.PresArrivalMethod",
+              "InjuryHx.GCSPreHospBestScore",
+              "InjuryHx.GCSMotorBaselineDerived", "InjuryHx.GCSScoreBaselineDerived",
+              "InjuryHx.PupilsBaselineDerived",
+              "InjuryHx.PresCirculationTreatmentCPR", "InjuryHx.PresCirculationTreatmentIVFluids",
+              "InjuryHx.PresEmergencyCareIntubation", "InjuryHx.PresEmergencyCareSuppOxygen",
+              "InjuryHx.PresEmergencyCareVentilation",
+              "response.time", "prehosp.time")
+numvar   <- c("Subject.Age","InjuryHx.GCSPreHospBestScore",
+              "InjuryHx.GCSMotorBaselineDerived", "InjuryHx.GCSScoreBaselineDerived",
+              "onscene_t", "arr.time", "prehosp.time", "response.time")
+facvar   <- vars[-which(vars%in%numvar)]
+
+tbl1_sarsap   <- CreateTableOne(vars = vars, 
+                                 strata = stratvar, 
+                                 data = df, 
+                                 factorVars = facvar)
+tbl1_sarsap.p <- print(tbl1_sarsap,
+                     nonnorm=numvar,
+                     missing=TRUE,
+                     printToggle=FALSE)
+kable(tbl1_sarsap.p)
+write.csv2(tbl1_sarsap.p, file="Output_v3/table1.csv")
+
+```
+
+Table 1, descriptive analysis of patients who received a scoop and run (<20 min), or stay and play (>20 min) policy on scene. 
+
+## Table 2
+
+```{r % hypoxic/hypotensive on arrival}
+df$hypotension <- as.numeric(df$InjuryHx.EDArrSBP<100)
+df$hypoxia <- as.numeric(df$InjuryHx.EDArrSpO2<90)
+#overall
+a <- table(df$hypotension)[2]
+b <- prop.table(table(df$hypotension))[2]
+c <- table(df$hypoxia)[2]
+d <- prop.table(table(df$hypoxia))[2]
+gen_ht <- paste(a, " (", sprintf("%.0f",b*100), "%)", sep="")
+gen_hx <- paste(c, " (", sprintf("%.0f",d*100), "%)", sep="")
+#mild
+a <- table(df$hypotension[df$InjuryHx.GCSScoreBaselineDerived>12])[2]
+b <- prop.table(table(df$hypotension[df$InjuryHx.GCSScoreBaselineDerived>12]))[2]
+c <- table(df$hypoxia[df$InjuryHx.GCSScoreBaselineDerived>12])[2]
+d <- prop.table(table(df$hypoxia[df$InjuryHx.GCSScoreBaselineDerived>12]))[2]
+mild_ht <- paste(a, " (", sprintf("%.0f",b*100), "%)", sep="")
+mild_hx <- paste(c, " (", sprintf("%.0f",d*100), "%)", sep="")
+
+#moderate
+a <- table(df$hypotension[df$InjuryHx.GCSScoreBaselineDerived%in%9:12])[2]
+b <- prop.table(table(df$hypotension[df$InjuryHx.GCSScoreBaselineDerived%in%9:12]))[2]
+c <- table(df$hypoxia[df$InjuryHx.GCSScoreBaselineDerived%in%9:12])[2]
+d <- prop.table(table(df$hypoxia[df$InjuryHx.GCSScoreBaselineDerived%in%9:12]))[2]
+mod_ht <- paste(a, " (", sprintf("%.0f",b*100), "%)", sep="")
+mod_hx <- paste(c, " (", sprintf("%.0f",d*100), "%)", sep="")
+
+#severe
+a <- table(df$hypotension[df$InjuryHx.GCSScoreBaselineDerived<9])[2]
+b <- prop.table(table(df$hypotension[df$InjuryHx.GCSScoreBaselineDerived<9]))[2]
+c <- table(df$hypoxia[df$InjuryHx.GCSScoreBaselineDerived<9])[2]
+d <- prop.table(table(df$hypoxia[df$InjuryHx.GCSScoreBaselineDerived<9]))[2]
+sev_ht <- paste(a, " (", sprintf("%.0f",b*100), "%)", sep="")
+sev_hx <- paste(c, " (", sprintf("%.0f",d*100), "%)", sep="")
+
+res <- matrix(data = c(gen_ht, gen_hx,
+                mild_ht, mild_hx,
+                mod_ht, mod_hx,
+                sev_ht, sev_hx),
+       nrow = 4, ncol = 2, 
+       byrow = TRUE,dimnames = list(c("Overall",
+                                       "GCS >12",
+                                       "GCS 9-12",
+                                       "GCS <9"),
+                                     c("Hypotension", 
+                                       "Hypoxia")))
+
+kable(res)
+write.csv2(res, file = "Output_v3/table2.csv")
+```
+
+Table 2, the number and percentage of patients with hypotension or hypoxia at arrival at the ED. 
+
+```{r}
+times$t3.2 <- as.numeric(ifelse(df$InjuryHx.PresTBIRef=="secondary", 
+                     difftime(time1 = ymd_hms(paste(df$InjuryHx.PresSTHospDate,
+                                                    df$InjuryHx.PresSTHospTime)),
+                              time2 = ymd_hms(paste(df$Subject.DateInj,
+                                                    df$Subject.TimeInj)),
+                              units="min"),
+                     NA))
+
+times$t3.2[times$t3.2<0]<-NA
+
+df <- merge(df, times, by="gupi")
+
+##subetcentersfig3
+fig3subset1 <- names(which(table(df$country,
+                                !is.na(df$t1)&
+                                  df$InjuryHx.PresTBIRef=="primary")[,2]>10))
+
+fig3subset2 <- names(which(table(df$country,
+                                !is.na(df$t1)&
+                                  df$InjuryHx.PresTBIRef=="secondary")[,2]>10))
+
+#primary referral
+prim_ref <- df$InjuryHx.PresTBIRef=="primary"
+t1_country1 <- aggregate(t1~country, data=df, FUN=median, 
+                         subset = prim_ref&df$country%in%fig3subset1)
+colnames(t1_country1) <- c("country", "t")
+n_t1_1 <- data.frame(table(df$country[prim_ref & df$country%in%fig3subset1]))
+t1_country1 <- merge(t1_country1,n_t1_1, by.x= "country", by.y="Var1")
+
+t2_country1 <- aggregate(t2~country, data=df, FUN=median, 
+                         subset = prim_ref&df$country%in%fig3subset1)
+colnames(t2_country1) <- c("country", "t")
+t2_country1 <- merge(t2_country1,n_t1_1, by.x= "country", by.y="Var1")
+
+t3_country1 <- aggregate(t3~country, data=df, FUN=median, 
+                         subset = prim_ref&df$country%in%fig3subset1)
+colnames(t3_country1) <- c("country", "t")
+t3_country1 <- merge(t3_country1,n_t1_1, by.x= "country", by.y="Var1")
+
+
+t3_country1$t <- t3_country1$t-t2_country1$t
+t2_country1$t <- t2_country1$t- t1_country1$t
+
+t_country1  <- rbind(t1_country1, t2_country1,t3_country1)
+t_country1$tp <- rep(c("Response time",
+                       "On scene",
+                       "Travel to study hospital"), each=nrow(t3_country1))
+t_country1$tp <- factor(t_country1$tp, levels=c("Travel to study hospital",
+                       "On scene",
+                       "Response time"))
+#secondary referral
+t1_country2 <- aggregate(t1~country, data=df, FUN=median, 
+                         subset = !prim_ref & df$country%in%fig3subset2)
+colnames(t1_country2) <- c("country", "t")
+n_t1_2 <- data.frame(table(df$country[!prim_ref & df$country%in%fig3subset2]))
+t1_country2 <- merge(t1_country2,n_t1_2, by.x= "country", by.y="Var1")
+
+t2_country2 <- aggregate(t2~country, data=df, FUN=median, 
+                         subset = !prim_ref & df$country%in%fig3subset2)
+colnames(t2_country2) <- c("country", "t")
+t2_country2 <- merge(t2_country2,n_t1_2, by.x= "country", by.y="Var1")
+
+t3_country2 <- aggregate(t3.2~country, data=df, FUN=median, 
+                         subset = !prim_ref & df$country%in%fig3subset2)
+colnames(t3_country2) <- c("country", "t")
+t3_country2 <- merge(t3_country2,n_t1_2, by.x= "country", by.y="Var1")
+
+t3_country2$t <- t3_country2$t-t2_country2$t
+t2_country2$t <- t2_country2$t- t1_country2$t
+
+t_country2  <- rbind(t1_country2, t2_country2,t3_country2)
+t_country2$tp <- rep(c("Response time",
+                       "On scene",
+                       "Travel to study hospital"), each=nrow(t3_country2))
+t_country2$tp <- factor(t_country2$tp, levels=c("Travel to study hospital",
+                       "On scene",
+                       "Response time"))
+##combine primary/secondary
+t_country1$ref <- as.character("Primary referral")
+t_country2$ref <- as.character("Secondary referral")
+t_country <- rbind(t_country1,t_country2)
+t_country$ref <- factor(t_country$ref, levels=c("Primary referral", "Secondary referral"))
+
+#reorder country levels
+tot_country <- aggregate(t3~country, data=df, FUN=median)
+order_countries <- as.character(tot_country$country[order(tot_country$t3, decreasing = TRUE)])
+
+t_country$country <- factor(t_country$country, levels=order_countries)
+
+figure3 <- ggplot(t_country, aes(x=country, y=t, fill=tp))+
+  geom_bar(stat="identity")+theme_bw()+
+  scale_fill_brewer("Time interval",palette="Accent")+
+  coord_flip()+
+  scale_y_continuous("Time (min)")+
+  theme(axis.text.y=element_text(size=18),
+        axis.text.x=element_text(size=18),
+        axis.title.x=element_text(size=20),
+        axis.title.y=element_text(size=20),
+        legend.title=element_text(size=20),
+        legend.text=element_text(size=18))+
+  facet_wrap(~ref)
+  
+```
+
+```{r impute for modeling, include=FALSE, eval=FALSE}
+df$heli <- as.numeric(df$InjuryHx.PresArrivalMethod=="helicopter")
+df$traveltime <- df$t3-df$t2
+df_toi<-df[,c("gupi","InjuryHx.PresEmergencyCareSuppOxygen",
+           "InjuryHx.PresCirculationTreatmentCPR",
+           "InjuryHx.PresCirculationTreatmentIVFluids",
+           "InjuryHx.PresEmergencyCareIntubation" ,
+           "InjuryHx.PresEmergencyCareVentilation",
+           "Subject.Sex",
+           "Subject.PatientType",
+           "Subject.Age",
+           "InjuryHx.PresTBIRef",
+           "InjuryHx.BestOfChestSpineISS",
+           "InjuryHx.BestOfFaceISS" ,
+           "InjuryHx.BestOfAbdomenPelvicLumbarISS",
+           "InjuryHx.BestOfExternaISS",
+           "InjuryHx.BestOfExtremitiesISS",
+           "InjuryHx.BestOfHeadBrainCervicalISS",
+           "InjuryHx.PupilsBaselineDerived",
+           "InjuryHx.GCSScoreBaselineDerived",
+           "Subject.GOSE6monthEndpointDerived",
+           "heli",
+           "onscene_t",
+           "t1",
+           "traveltime",
+           "MEI",
+           "InjuryHx.EDArrSBP",
+           "InjuryHx.EDArrSpO2")]
+df_toi$prehosp_t <- ifelse(df$InjuryHx.PresTBIRef=="primary",
+                           df$t3, df$t3.2)
+df_toi$RTI <- as.numeric(df$InjuryHx.InjCause=="RTI")
+df_toi$physician <- as.numeric(df$InjuryHx.PresEmergencyCare%in%c("physician",
+                                                                  "medical rescue team"))
+
+df_toi$Subject.GOSE6monthEndpointDerived <- factor(df_toi$Subject.GOSE6monthEndpointDerived)
+
+save(df_toi, file = "Data/toimpute.RData")
+
+##add country and site
+load("Data/Sleutellijst.rdata")
+df_toi<-merge(df_toi, dt.key[,c("gupi",
+                                "country",
+                                "center")], by="gupi")
+
+dfi0 <- mice(df_toi, maxit=0)
+meth<-dfi0$method
+pred<-dfi0$predictorMatrix
+
+pred[,c("gupi","center", "country")] <- 0
+
+dfi <- mice(df_toi, m=5, method = meth, predictorMatrix = pred,printFlag = FALSE, seed = 123)
+plot(dfi)
+densityplot(dfi)
+save(dfi, file = "Data/imputed.RData")
+```
+
+## Figure 1
+
+```{r, fig.width=10}
+load("Data/imputed.RData")
+load("Data/toimpute.RData")
+fit <- with(dfi, lmer(onscene_t~Subject.Age+
+                         Subject.Sex+
+                         MEI+
+                         traveltime+
+                         InjuryHx.PresEmergencyCareVentilation+
+                         InjuryHx.PresCirculationTreatmentIVFluids+
+                         InjuryHx.PresCirculationTreatmentCPR+
+                         InjuryHx.PresEmergencyCareIntubation+
+                         physician+
+                         InjuryHx.GCSScoreBaselineDerived+
+                         I(InjuryHx.PupilsBaselineDerived%in%c(1,2))+
+                         RTI+
+                         InjuryHx.PresTBIRef+
+                         (1|country/center))) 
+fit_fe <- with(dfi,lm(onscene_t~Subject.Age+
+                         Subject.Sex+
+                         MEI+
+                         traveltime+
+                         InjuryHx.PresEmergencyCareVentilation+
+                         InjuryHx.PresCirculationTreatmentIVFluids+
+                         InjuryHx.PresCirculationTreatmentCPR+
+                         InjuryHx.PresEmergencyCareIntubation+
+                         physician+
+                         InjuryHx.GCSScoreBaselineDerived+
+                         I(InjuryHx.PupilsBaselineDerived%in%c(1,2))+
+                         RTI+
+                         InjuryHx.PresTBIRef))
+
+plot.df <- data.frame(summary(pool(fit)))
+
+
+##age travt gcs (IQR)
+calc_iqr <- function(x){
+  lo <- quantile(x, na.rm=TRUE, probs=0.25)
+  hi <- quantile(x, na.rm=TRUE, probs=0.75)
+  range <- hi-lo
+  return(range)
+}
+plot.df["Subject.Age",
+        c("estimate", "std.error")] <- plot.df["Subject.Age",
+                                                c("estimate",
+                                                  "std.error")]*calc_iqr(df$Subject.Age)
+plot.df["InjuryHx.GCSScoreBaselineDerived",
+        c("estimate", "std.error")] <- plot.df["InjuryHx.GCSScoreBaselineDerived",
+                                                c("estimate",
+                                                  "std.error")]* calc_iqr(
+                                                    df$InjuryHx.GCSScoreBaselineDerived)
+plot.df["traveltime",
+        c("estimate", "std.error")] <- plot.df["traveltime",
+                                                c("estimate",
+                                                  "std.error")]*calc_iqr(df$traveltime)
+
+plot.df$lo <- plot.df$estimate-1.96*plot.df$std.error
+plot.df$hi <- plot.df$estimate+1.96*plot.df$std.error
+
+plot.df$var <- rownames(plot.df)
+plot.df$var <- c("intect", "Age (IQR)", "Male", "MEI", "Traveltime (IQR)", 
+                 "Ventilation","IV fluids", "CPR","Prehospital intubation",
+                 "Physician at scene","GCS (IQR)", "Pupil(s) unreactive", "RTI", 
+                 "Secondary referral")
+plot.df <- plot.df[,c(1,6,7,8)]
+
+
+#add vargroup names
+vargroups <- data.frame(estimate=NA, lo=NA, hi=NA, var=c("Demographic             ",
+                                                         "Severity                ",
+                                                         "Situational             ",
+                                                         "Interventions           "))
+plot.df <- rbind(plot.df, vargroups)
+plot.df$var <- factor(plot.df$var, levels=c("Ventilation",
+                                            "CPR",
+                                            "IV fluids",
+                                            "Prehospital intubation",
+                                            "Interventions           ",
+                                            "RTI",
+                                            "Secondary referral",
+                                            "Physician at scene",
+                                            "Traveltime (IQR)",
+                                            "Situational             ",
+                                            "MEI",
+                                            "Pupil(s) unreactive",
+                                            "GCS (IQR)",
+                                            "Severity                ",
+                                            "Male",
+                                            "Age (IQR)",
+                                            "Demographic             ",
+                                            "intect"))
+
+##partial R2 country
+pred_re <- apply(sapply(fit$analyses, predict),1,mean)
+pred_fe <- apply(sapply(fit_fe$analyses, predict),1,mean)
+obs     <- apply(complete(dfi, action = "repeated")[paste("onscene_t.",1:5, sep="")],1,mean)
+
+r2_re <- cor(pred_re, obs, method = "pearson")^2
+r2_fe <- cor(pred_fe, obs, method = "pearson")^2
+part_r2 <- paste("Partial R2:",
+                 sprintf("%.2f", r2_re-r2_fe),
+                 "/",
+                 sprintf("%.2f", r2_re))
+
+plot_sarsapeff<-ggplot(plot.df[-1,], aes(x=var, y=estimate, ymin=lo, ymax=hi))+
+  geom_linerange(cex=2)+
+  geom_point(cex=3)+
+  theme_bw()+
+  geom_hline(yintercept = 0)+
+  ylab("Mean additional on-scene time (minutes)")+
+  coord_flip()+
+  annotate("text",x=15,y=8, label=part_r2, cex=6)+ 
+  theme(axis.text.x=element_text(size=16),
+        axis.text.y=element_text(size=16),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size=18))
+plot_sarsapeff
+
+pdf("Output_v3/fig1.pdf", width=10)
+plot_sarsapeff
+dev.off()
+
+
+resfig1 <- plot.df[-1,]
+resfig1$nice <- paste(sprintf("%.2f", resfig1$estimate),
+                      " (",
+                      sprintf("%.2f", resfig1$lo),
+                      " - ",
+                      sprintf("%.2f", resfig1$hi),
+                      ")",
+                      sep="")
+resfig1 <- resfig1[1:13,c("var", "nice")]
+```
+
+Figure 1, a dot plot showing the independent effects on on-scene time of demographic factors, injury severity, situational factors, and interventions given. The estimates can be interpreted as follows: this factor increases or decreasing the on-scene time by x minutes, independent of the other factors displayed. This is the result of a multivariable mixed effects linear regression model with a random intercept for center conditional on country. The coefficients (and 95% confidence intervals) of the model are displayed. The partial R2 displayed is the percentage of the full model attributable to between country differences.  RTI, Road traffic incident; MEI, major extracranial injury; GCS, Glasgow Coma Scale; IQR, interquartile range; CPR, cardiopulmonary resuscitation; IV, intravenous.
+
+## Figure 2
+
+```{r, fig.width=10}
+fithypot <- with(dfi, glm(InjuryHx.EDArrSBP<100~
+                         InjuryHx.PresCirculationTreatmentIVFluids+
+                           InjuryHx.PresEmergencyCareVentilation+
+                         MEI+
+                         InjuryHx.PresEmergencyCareIntubation+
+                         onscene_t+
+                         prehosp_t+
+                         InjuryHx.PupilsBaselineDerived+
+                         InjuryHx.GCSScoreBaselineDerived+
+                         Subject.Age+
+                         InjuryHx.PresTBIRef,  
+                         family="binomial"))
+fithypox <- with(dfi,glm(InjuryHx.EDArrSpO2<90~
+                         InjuryHx.PresCirculationTreatmentIVFluids+
+                           InjuryHx.PresEmergencyCareVentilation+
+                         MEI+
+                         InjuryHx.PresEmergencyCareIntubation+
+                         onscene_t+
+                         prehosp_t+
+                         InjuryHx.PupilsBaselineDerived+
+                         InjuryHx.GCSScoreBaselineDerived+
+                         Subject.Age+
+                         InjuryHx.PresTBIRef, family="binomial"))
+n1    <- table(df$InjuryHx.EDArrSBP<100)[2]
+beta1 <- pool(fithypot)$pooled[,"estimate"]
+se1   <- summary(pool(fithypot))[,"std.error"]
+n2    <- table(df$InjuryHx.EDArrSpO2<90)[2]
+beta2 <- pool(fithypox)$pooled[,"estimate"]
+se2   <- summary(pool(fithypox))[,"std.error"]
+
+names_coef <- rownames(pool(fithypot)$pooled)
+names(beta1) <- names_coef
+names(se1)   <- names_coef
+names(beta2) <- names_coef
+names(se2)   <- names_coef
+
+for (i in c("onscene_t", "prehosp_t", "Subject.Age", "InjuryHx.GCSScoreBaselineDerived")){
+  beta1[i] <- beta1[i]*calc_iqr(df_toi[i])
+  beta2[i] <- beta2[i]*calc_iqr(df_toi[i])
+  se1[i] <- se1[i]*calc_iqr(df_toi[i])
+  se2[i] <- se2[i]*calc_iqr(df_toi[i])
+}
+
+
+plot.df <- data.frame(beta=c(beta1[-1], beta2[-1]),
+           se=c(se1[-1], se2[-1]),
+           outcome=c(rep("Hypotension (n=196)", length(beta1[-1])),
+                     rep("Hypoxia (n=96)", length(beta1[-1]))),
+           var=rep(c("IV fluids",
+                     "Ventilation",
+                     "MEI",
+                     "Intubation",
+                     "On-scene time (IQR)",
+                     "Prehospital time (IQR)",
+                     "One reactive pupil",
+                     "No reactive pupil",
+                     "GCS (IQR)",
+                     "Age (IQR)",
+                     "Secondary referral"),2))
+
+plot.df$var <- factor(plot.df$var, 
+                      levels=c("IV fluids",
+                     "Ventilation",
+                     "Intubation",
+                     "On-scene time (IQR)",
+                     "Prehospital time (IQR)",
+                     "Secondary referral",
+                     "MEI",
+                     "No reactive pupil",
+                     "One reactive pupil",
+                     "GCS (IQR)",
+                     "Age (IQR)"))
+
+plot_hypox_hypot<-ggplot(plot.df, aes(x=var, y=beta, ymin=beta-1.96*se, ymax=beta+1.96*se))+
+  geom_linerange(cex=2)+
+  geom_point(cex=3)+
+  theme_bw()+
+  geom_hline(yintercept = 0)+
+  ylab("Log(OR)")+ 
+  theme(axis.text.x=element_text(size=16),
+        axis.text.y=element_text(size=16),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size=18),
+        strip.text = element_text(size=18))+
+  coord_flip()+
+  facet_wrap(~outcome)
+plot_hypox_hypot
+
+pdf("Output_v3/fig2.pdf", width=10)
+plot_hypox_hypot
+dev.off()
+
+resfig2 <- plot.df
+resfig2$nice <- paste(sprintf("%.2f", exp(resfig2$beta)),
+                      " (",
+                      sprintf("%.2f", exp(resfig2$beta-1.96*resfig2$se)),
+                      " - ",
+                      sprintf("%.2f", exp(resfig2$beta+1.96*resfig2$se)),
+                      ")",
+                      sep="")
+resfig2 <- cbind(resfig2[1:(nrow(resfig2)/2),c("var", "nice")],
+                 hypoxia=resfig2[(nrow(resfig2)/2+1):nrow(resfig2),c("nice")])
+colnames(resfig2)[2] <- "hypotension"
+```
+
+Figure 2, the effect on hypotension (systolic blood pressure < 100 mmHg) or hypoxia (oxygen saturation < 90%) at arrival at the emergency department of demographic factors, injury severity, situational factors, and interventions given. The effects are based on a logistic multivariable regression model.
+
+
+
+## Figure 3
+
+```{r, fig.width=10}
+figure3
+pdf("Output_v3/fig3.pdf")
+figure3
+dev.off()
+```
+
+Figure 3, a bar chart showing the time spent in different prehospital phases per country. Bars based on more than 10 patients are displayed.
+
+## Figure 4
+
+```{r, fig.width=40, fig.height=24}
+
+#######on scene time
+fit_ost <- with(dfi, lmer(onscene_t~ 
+                            I(Subject.Age-
+                                mean(df$Subject.Age,
+                                     na.rm=TRUE))+
+                            InjuryHx.PupilsBaselineDerived+
+                            I(InjuryHx.GCSScoreBaselineDerived-
+                                mean(df$InjuryHx.GCSScoreBaselineDerived,
+                                     na.rm=TRUE))+
+                            Subject.PatientType+
+                            (1|country/center),
+                          subset=prim_ref))
+
+rand_eff <- lapply(fit_ost$analyses, lme4::ranef, condVar=TRUE)
+
+rand_eff_ost<- expand.grid(data.frame(rand_eff[[1]])$grp,
+                            est=0,
+                            se = 0)
+i<-1
+while(i<(dfi$m+1)){
+rand_eff_ost$est<-rand_eff_ost$est+data.frame(rand_eff[[i]])[, "condval"]  
+rand_eff_ost$se<-rand_eff_ost$est+data.frame(rand_eff[[i]])[, "condsd"]
+i<-i+1
+}
+rand_eff_ost$est<-rand_eff_ost$est/dfi$m
+rand_eff_ost$se <- rand_eff_ost$se/dfi$m
+rand_eff_ost <- rand_eff_ost[rand_eff_ost$Var1%in%unique(dfi$data$country),]
+
+
+###########make map
+library(maps)
+library(maptools)
+
+key.maps     <- data.frame(country=as.character(unique(dfi$data$country)),
+                           region=c("uk", "netherlands","sweden",
+                                    "spain", "belgium", "italy", "norway",
+                                    "serbia","latvia","germany","france","finland", 
+                                    "austria","lithuania",
+                                    "romania", "hungary", "Israel"))
+ost_maps <- merge(rand_eff_ost, key.maps, 
+                     by.x="Var1",by="country")
+colnames(ost_maps) <- c("country", "est", "se", "region")
+
+world        <- map_data("world")
+world$region <- tolower(world$region) 
+world        <- world[world$region!="antarctica", ]
+
+##add on scene time
+world_ost<-world
+world_ost$est <- ost_maps$est[match(world$region, ost_maps$region, nomatch=NA)] 
+ost_plot <- ggplot() + 
+  geom_polygon(data = world_ost, aes(long, lat, 
+                                 group = group, 
+                                 fill = est))+
+  theme_bw()+
+  theme(line = element_blank()) + 
+  scale_x_continuous(limits=c(-11,33),labels = NULL, name = element_blank()) + 
+  scale_y_continuous(limits=c(35,70),labels = NULL, expand = c(0, 0), name = element_blank())+
+  scale_fill_distiller(name="Average on-scene time, \nmore or less than average, min", 
+                        palette="Spectral")+
+  theme(legend.position = "bottom",
+        legend.title=element_text(size=30),
+        legend.text=element_text(size=25),
+        legend.key.size = unit(1.5, "cm"),
+        legend.key.width = unit(3,"cm"))+
+  annotate("text",x=-5, y=65,
+           label=paste(sprintf("%.0f",
+                               mean(aggregate(onscene_t~country, 
+                                         data=dfi$data, 
+                                         subset = prim_ref,
+                                         median)[,2])),
+                       "minutes"),cex=10)
+
+
+##prehospital time
+fit_tvt <- with(dfi, lmer(traveltime~
+                            I(Subject.Age-
+                                mean(df$Subject.Age,
+                                     na.rm=TRUE))+
+                            InjuryHx.PupilsBaselineDerived+
+                            I(InjuryHx.GCSScoreBaselineDerived-
+                                mean(df$InjuryHx.GCSScoreBaselineDerived,
+                                     na.rm=TRUE))+
+                            Subject.PatientType+
+                            (1|country/center),
+                          subset=prim_ref))
+
+rand_eff <- lapply(fit_tvt$analyses, lme4::ranef, condVar=TRUE)
+
+rand_eff_tvt<- expand.grid(data.frame(rand_eff[[1]])$grp,
+                            est=0,
+                            se = 0)
+i<-1
+while(i<(dfi$m+1)){
+rand_eff_tvt$est<-rand_eff_tvt$est+data.frame(rand_eff[[i]])[, "condval"]  
+rand_eff_tvt$se<-rand_eff_tvt$est+data.frame(rand_eff[[i]])[, "condsd"]
+i<-i+1
+}
+rand_eff_tvt$est<-rand_eff_tvt$est/dfi$m
+rand_eff_tvt$se <- rand_eff_tvt$se/dfi$m
+rand_eff_tvt <- rand_eff_tvt[rand_eff_tvt$Var1%in%unique(dfi$data$country),]
+
+
+###########make map
+tvt_maps <- merge(rand_eff_tvt, key.maps, 
+                     by.x="Var1",by="country")
+colnames(tvt_maps) <- c("country", "est", "se", "region")
+
+##add prehospital time
+world_tvt<-world
+world_tvt$est <- tvt_maps$est[match(world_tvt$region, tvt_maps$region, nomatch=NA)] 
+tvt_plot <- ggplot() + 
+  geom_polygon(data = world_tvt, aes(long, lat, 
+                                 group = group, 
+                                 fill = est))+
+  theme_bw()+
+  theme(line = element_blank()) + 
+  scale_x_continuous(limits=c(-11,33),labels = NULL, name = element_blank()) + 
+  scale_y_continuous(limits=c(35,70),labels = NULL, expand = c(0, 0), name = element_blank())+
+  scale_fill_distiller(name="Average travel time, \nmore or less than average, min", 
+                        palette="Spectral")+
+  theme(legend.position = "bottom",
+        legend.title=element_text(size=30),
+        legend.text=element_text(size=25),
+        legend.key.size = unit(1.5, "cm"),
+        legend.key.width = unit(3,"cm"))+
+  annotate("text",x=-5, y=65,
+           label=paste(sprintf("%.0f",
+                               mean(aggregate(traveltime~country, 
+                                         data=dfi$data, 
+                                         subset = prim_ref,
+                                         median)[,2])),
+                       "minutes"),cex=10)
+
+##aanrijtijd
+fit_art <- with(dfi, lmer(t1~
+                            I(Subject.Age-
+                                mean(df$Subject.Age,
+                                     na.rm=TRUE))+
+                            InjuryHx.PupilsBaselineDerived+
+                            I(InjuryHx.GCSScoreBaselineDerived-
+                                mean(df$InjuryHx.GCSScoreBaselineDerived,
+                                     na.rm=TRUE))+
+                            Subject.PatientType+
+                            (1|country/center),
+                          subset=prim_ref))
+
+rand_eff <- lapply(fit_art$analyses, lme4::ranef, condVar=TRUE)
+
+rand_eff_art<- expand.grid(data.frame(rand_eff[[1]])$grp,
+                            est=0,
+                            se = 0)
+i<-1
+while(i<(dfi$m+1)){
+rand_eff_art$est<-rand_eff_art$est+data.frame(rand_eff[[i]])[, "condval"]  
+rand_eff_art$se<-rand_eff_art$est+data.frame(rand_eff[[i]])[, "condsd"]
+i<-i+1
+}
+rand_eff_art$est<-rand_eff_art$est/dfi$m
+rand_eff_art$se <- rand_eff_art$se/dfi$m
+rand_eff_art <- rand_eff_art[rand_eff_art$Var1%in%unique(dfi$data$country),]
+
+
+###########make map
+art_maps <- merge(rand_eff_art, key.maps, 
+                     by.x="Var1",by="country")
+colnames(art_maps) <- c("country", "est", "se", "region")
+
+##add prehospital time
+world_art<-world
+world_art$est <- art_maps$est[match(world_art$region, art_maps$region, nomatch=NA)] 
+art_plot <- ggplot() + 
+  geom_polygon(data = world_art, aes(long, lat, 
+                                 group = group, 
+                                 fill = est))+
+  theme_bw()+
+  theme(line = element_blank()) + 
+  scale_x_continuous(limits=c(-11,33),labels = NULL, name = element_blank()) + 
+  scale_y_continuous(limits=c(35,70),labels = NULL, expand = c(0, 0), name = element_blank())+
+  scale_fill_distiller(name="Average response time, \nmore or less than average, min", 
+                        palette="Spectral")+
+  theme(legend.position = "bottom",
+        legend.title=element_text(size=30),
+        legend.text=element_text(size=25),
+        legend.key.size = unit(1.5, "cm"),
+        legend.key.width = unit(3,"cm"))+
+  annotate("text",x=-5, y=65,
+           label=paste(sprintf("%.0f",
+                               mean(aggregate(t1~country, 
+                                         data=dfi$data, 
+                                         subset = prim_ref,
+                                         median)[,2])),
+                       "minutes"),cex=10)
+
+
+
+### phi
+fit_phi <- with(dfi, glmer(InjuryHx.PresEmergencyCareIntubation~
+                            I(Subject.Age-
+                                mean(df$Subject.Age,
+                                     na.rm=TRUE))+
+                            InjuryHx.PupilsBaselineDerived+
+                            I(InjuryHx.GCSScoreBaselineDerived-
+                                mean(df$InjuryHx.GCSScoreBaselineDerived,
+                                     na.rm=TRUE))+
+                            Subject.PatientType+
+                            (1|country/center),
+                           family="binomial"))
+
+rand_eff <- lapply(fit_phi$analyses, lme4::ranef, condVar=TRUE)
+
+rand_eff_phi<- expand.grid(data.frame(rand_eff[[1]])$grp,
+                            est=0,
+                            se = 0)
+i<-1
+while(i<(dfi$m+1)){
+rand_eff_phi$est<-rand_eff_phi$est+data.frame(rand_eff[[i]])[, "condval"]  
+rand_eff_phi$se<-rand_eff_phi$est+data.frame(rand_eff[[i]])[, "condsd"]
+i<-i+1
+}
+rand_eff_phi$est<-rand_eff_phi$est/dfi$m
+rand_eff_phi$se <- rand_eff_phi$se/dfi$m
+rand_eff_phi <- rand_eff_phi[rand_eff_phi$Var1%in%unique(dfi$data$country),]
+
+
+###########make map
+phi_maps <- merge(rand_eff_phi, key.maps, 
+                     by.x="Var1",by="country")
+colnames(phi_maps) <- c("country", "est", "se", "region")
+
+#calculate mor
+var_phi <- mean(unlist(data.frame(sapply(fit_phi$analyses, lme4::VarCorr))["country",]))
+mor_phi <- bgravesteijn::MORcalc(var_phi)
+
+##add phi
+world_phi<-world
+world_phi$est <- phi_maps$est[match(world_phi$region, phi_maps$region, nomatch=NA)] 
+phi_plot <- ggplot() + 
+  geom_polygon(data = world_phi, aes(long, lat, 
+                                 group = group, 
+                                 fill = est))+
+  theme_bw()+
+  theme(line = element_blank()) + 
+  scale_x_continuous(limits=c(-11,33),labels = NULL, name = element_blank()) + 
+  scale_y_continuous(limits=c(35,70),labels = NULL, expand = c(0, 0), name = element_blank())+
+  scale_fill_distiller(name="Log-odds for prehospital intubation, \nmore or less than average", 
+                        palette="Spectral")+
+  theme(legend.position = "bottom",
+        legend.title=element_text(size=30),
+        legend.text=element_text(size=25),
+        legend.key.size = unit(1.5, "cm"),
+        legend.key.width = unit(3,"cm"))+
+  annotate("text",x=-5, y=65,
+           label=paste("MOR =",
+                       sprintf("%.2f",mor_phi)),cex=10)
+
+
+##############InjuryHx.PresCirculationTreatmentIVFluids
+fit_ivf <- with(dfi, glmer(InjuryHx.PresCirculationTreatmentIVFluids~
+                            I(Subject.Age-
+                                mean(df$Subject.Age,
+                                     na.rm=TRUE))+
+                            InjuryHx.PupilsBaselineDerived+
+                            I(InjuryHx.GCSScoreBaselineDerived-
+                                mean(df$InjuryHx.GCSScoreBaselineDerived,
+                                     na.rm=TRUE))+
+                            Subject.PatientType+
+                            (1|country/center),
+                           family="binomial"))
+
+rand_eff <- lapply(fit_ivf$analyses, lme4::ranef, condVar=TRUE)
+
+rand_eff_ivf<- expand.grid(data.frame(rand_eff[[1]])$grp,
+                            est=0,
+                            se = 0)
+i<-1
+while(i<(dfi$m+1)){
+rand_eff_ivf$est<-rand_eff_ivf$est+data.frame(rand_eff[[i]])[, "condval"]  
+rand_eff_ivf$se<-rand_eff_ivf$est+data.frame(rand_eff[[i]])[, "condsd"]
+i<-i+1
+}
+rand_eff_ivf$est<-rand_eff_ivf$est/dfi$m
+rand_eff_ivf$se <- rand_eff_ivf$se/dfi$m
+rand_eff_ivf <- rand_eff_ivf[rand_eff_ivf$Var1%in%unique(dfi$data$country),]
+
+
+###########make map
+ivf_maps <- merge(rand_eff_ivf, key.maps, 
+                     by.x="Var1",by="country")
+colnames(ivf_maps) <- c("country", "est", "se", "region")
+
+#calculate mor
+var_ivf <- mean(unlist(data.frame(sapply(fit_ivf$analyses, lme4::VarCorr))["country",]))
+mor_ivf <- bgravesteijn::MORcalc(var_ivf)
+
+##add ivf
+world_ivf<-world
+world_ivf$est <- ivf_maps$est[match(world_ivf$region, ivf_maps$region, nomatch=NA)] 
+ivf_plot <- ggplot() + 
+  geom_polygon(data = world_ivf, aes(long, lat, 
+                                 group = group, 
+                                 fill = est))+
+  theme_bw()+
+  theme(line = element_blank()) + 
+  scale_x_continuous(limits=c(-11,33),labels = NULL, name = element_blank()) + 
+  scale_y_continuous(limits=c(35,70),labels = NULL, expand = c(0, 0), name = element_blank())+
+  scale_fill_distiller(name="Log-odds for IV fluids, \nmore or less than average", 
+                        palette="Spectral")+
+  theme(legend.position = "bottom",
+        legend.title=element_text(size=30),
+        legend.text=element_text(size=25),
+        legend.key.size = unit(1.5, "cm"),
+        legend.key.width = unit(3,"cm"))+
+  annotate("text",x=-5, y=65,
+           label=paste("MOR =",
+                       sprintf("%.2f",mor_ivf)),cex=10)
+
+
+##############heli
+fit_heli <- with(dfi, glmer(heli~
+                            I(Subject.Age-
+                                mean(df$Subject.Age,
+                                     na.rm=TRUE))+
+                            InjuryHx.PupilsBaselineDerived+
+                            I(InjuryHx.GCSScoreBaselineDerived-
+                                mean(df$InjuryHx.GCSScoreBaselineDerived,
+                                     na.rm=TRUE))+
+                            Subject.PatientType+
+                            (1|country/center),
+                           family="binomial"))
+
+rand_eff <- lapply(fit_heli$analyses, lme4::ranef, condVar=TRUE)
+
+rand_eff_heli<- expand.grid(data.frame(rand_eff[[1]])$grp,
+                            est=0,
+                            se = 0)
+i<-1
+while(i<(dfi$m+1)){
+rand_eff_heli$est<-rand_eff_heli$est+data.frame(rand_eff[[i]])[, "condval"]  
+rand_eff_heli$se<-rand_eff_heli$est+data.frame(rand_eff[[i]])[, "condsd"]
+i<-i+1
+}
+rand_eff_heli$est<-rand_eff_heli$est/dfi$m
+rand_eff_heli$se <- rand_eff_heli$se/dfi$m
+rand_eff_heli <- rand_eff_heli[rand_eff_heli$Var1%in%unique(dfi$data$country),]
+
+
+###########make map
+heli_maps <- merge(rand_eff_heli, key.maps, 
+                     by.x="Var1",by="country")
+colnames(heli_maps) <- c("country", "est", "se", "region")
+
+#calculate mor
+var_heli <- mean(unlist(data.frame(sapply(fit_heli$analyses, lme4::VarCorr))["country",]))
+mor_heli <- bgravesteijn::MORcalc(var_heli)
+
+##add ivf
+world_heli<-world
+world_heli$est <- heli_maps$est[match(world_heli$region, heli_maps$region, nomatch=NA)] 
+heli_plot <- ggplot() + 
+  geom_polygon(data = world_heli, aes(long, lat, 
+                                 group = group, 
+                                 fill = est))+
+  theme_bw()+
+  theme(line = element_blank()) + 
+  scale_x_continuous(limits=c(-11,33),labels = NULL, name = element_blank()) + 
+  scale_y_continuous(limits=c(35,70),labels = NULL, expand = c(0, 0), name = element_blank())+
+  scale_fill_distiller(name="Log-odds for helicopter, \nmore or less than average", 
+                        palette="Spectral")+
+  theme(legend.position = "bottom",
+        legend.title=element_text(size=30),
+        legend.text=element_text(size=25),
+        legend.key.size = unit(1.5, "cm"),
+        legend.key.width = unit(3,"cm"))+
+  annotate("text",x=-5, y=65,
+           label=paste("MOR =",
+                       sprintf("%.2f",mor_heli)),cex=10)
+
+bgravesteijn::multiplot(tvt_plot, ost_plot, art_plot, 
+                        phi_plot, ivf_plot, heli_plot,
+                        layout=matrix(1:6, nrow = 2, byrow = TRUE))
+pdf("Output_v3/fig4.pdf", width=40, height=24)
+bgravesteijn::multiplot(tvt_plot, ost_plot, art_plot, 
+                        phi_plot, ivf_plot, heli_plot,
+                        layout=matrix(1:6, nrow = 2, byrow = TRUE))
+dev.off()
+```
+
+
+Figure 4, the adjusted variation in prehospital time (upper row), and use of key prehospital interventions (bottom row) across Europe. Every map shows the deviation from the average of each country. In the upper row, the mean of the median time per country is showed. Moreover, secondarily refered patients are excluded from the analysis in the upper row. The estimates of the random intercepts for each country are displayed. These are adjusted for the IMPACT core variables (age, pupils, and GCS), the CENTER-TBI stratum in which the patient was included, and the random variation at the centre level. 
+
+## Figure 5
+
+```{r, fig.height=8}
+pp <- readxl::read_excel("Data/Q3_18.07.2016.xlsx")
+pp$SceneTraumaPolicy <- factor(pp$SceneTraumaPolicy)
+levels(pp$SceneTraumaPolicy) <- c("Scoop and run", "Mostly Scoop and run", "Mostly Stay and play", "Stay and play", NA)
+
+dt.key2 <- merge(dt.key[,c("gupi", "ppid")], 
+                 pp[,c("SiteID", "SceneTraumaPolicy")], 
+                 by.x="ppid",by.y="SiteID", all.x=TRUE)
+
+
+dt.key3 <- dt.key2[dt.key2$gupi%in%dfi$data$gupi,]
+
+df <- dfi$data
+
+df <- merge(df, dt.key3, by="gupi")
+
+dfi <- cbind(dfi,SceneTraumaPolicy=df$SceneTraumaPolicy)
+
+fitppadj     <- lmer(log(onscene_t)~SceneTraumaPolicy+
+                    InjuryHx.GCSScoreBaselineDerived+
+                    I(prehosp_t-t1)+
+                    InjuryHx.PresEmergencyCareIntubation+
+                    Subject.PatientType+
+                    InjuryHx.PupilsBaselineDerived+
+                    Subject.Sex+
+                    (1|center),
+                  data=df[!is.na(df$SceneTraumaPolicy),], REML = FALSE,subset=prim_ref)
+
+fitppnulladj <- update(fitppadj,formula=log(onscene_t)~InjuryHx.GCSScoreBaselineDerived+
+                    I(prehosp_t-t1)+
+                    InjuryHx.PresEmergencyCareIntubation+
+                    Subject.PatientType+
+                    InjuryHx.PupilsBaselineDerived+
+                    Subject.Sex+(1|center))
+fitpp     <- update(fitppadj,formula=log(onscene_t)~SceneTraumaPolicy+(1|center))
+fitppnull <- update(fitpp,formula=log(onscene_t)~1+(1|center))
+
+anovatestadj <- anova(fitppadj, fitppnulladj, test="F")
+
+pvalppadj <- anovatestadj$`Pr(>Chisq)`
+
+anovatest <- anova(fitpp, fitppnull, test="F")
+
+pvalpp <- anovatest$`Pr(>Chisq)`[2]
+
+nd <- with(df,
+           expand.grid(InjuryHx.GCSScoreBaselineDerived=median(InjuryHx.GCSScoreBaselineDerived,na.rm=TRUE),
+                       prehosp_t=median(prehosp_t, na.rm=TRUE),
+                       t1=median(t1, na.rm=TRUE),
+                       InjuryHx.PresEmergencyCareIntubation=factor(0),
+                       Subject.PatientType=factor("ER"),
+                       InjuryHx.PupilsBaselineDerived=factor(0),
+                       Subject.Sex=factor("M"),
+                       center=factor(unique(df$center)))
+)
+policy_df <- unique(df[!is.na(df$SceneTraumaPolicy),c("center", "SceneTraumaPolicy")])
+nd <- merge(nd, policy_df, by="center")
+
+nd$pred     <- predict(fitpp, newdata=nd)
+nd$pred_adj <- predict(fitppadj, newdata=nd)
+
+ndf <- data.frame(table(df$center))
+colnames(ndf) <- c("center", "N")
+
+nd <- merge(nd, ndf, by="center")
+
+adj <- nd[,c("center", "pred_adj", "SceneTraumaPolicy", "N")]
+colnames(adj)[2] <- "pred"
+unadj <- nd[,c("center", "pred", "SceneTraumaPolicy", "N")]
+
+plot_res <- rbind(unadj,adj)
+plot_res$adjusted <- c(rep(paste("Not adjusted",
+                                 " (p = ",
+                                 sprintf("%.2f",pvalpp),
+                                 ")", 
+                                 sep=""), 
+                           nrow(adj)), 
+                       rep(paste("Adjusted",
+                                 " (p = ",
+                                 sprintf("%.2f",pvalppadj[2]),
+                                 ")",
+                                 sep=""), 
+                           nrow(unadj)))
+plot_res$adjusted <- factor(plot_res$adjusted, 
+                            levels=unique(plot_res$adjusted))
+
+res_plot <- ggplot(plot_res,
+       aes(x=SceneTraumaPolicy, y=pred))+
+  geom_point(position = position_jitter(width = 0.2), aes(size=N))+
+  scale_size_continuous(breaks = c(10,30,50,100,200))+
+  geom_boxplot(alpha=0.5)+
+  ylab("Log-transformed Median on-scene time")+
+  theme_bw()+
+  theme(text=element_text(size=16),
+        axis.text.x=element_text(angle=90))+
+  facet_wrap(~adjusted)
+res_plot
+
+pdf("Output_v3/fig5.pdf", height=8)
+res_plot
+dev.off()
+
+```
+
+
+Figure 5, the unadjusted and adjusted log transformed median on-scene times. The bubbles represent the random intercept value for the model predicting on-scene time with center as random intercept. The right panel shows the estimates adjusted for GCS, traveltime, intubation, pupils, and sex (which were identified drivers of on-scene). Secondary referrals were excluded.  
+
+#Supplemental material
+
+## Figure 1 
+
+```{r, fig.width=10}
+grid.newpage()
+# set some parameters to use repeatedly
+leftx <- .3
+midx <- .5
+rightx <- .8
+width <- .25
+gp <- gpar(fill = "lightgrey")
+# create boxes
+(total_uk <- boxGrob(label = paste("Total\n n = ", n[1]),
+                    x=midx, y=.9, box_gp = gp, width = width))
+
+(crit1.in_uk <- boxGrob(label = paste("Remaining\n n = ", n[2]),
+                       x=midx, y=.625, box_gp = gp, width = width))
+
+connectGrob(total_uk, crit1.in_uk, "v")
+
+(crit1.excl_uk <- boxGrob(label = paste("Walk-in\n n = ",n[1]-n[2]),
+                         x=rightx, y=mean(c(0.9,0.625)), box_gp = gp, width = width))
+
+connectGrob(total_uk, crit1.excl_uk, "-")
+
+(crit2.in_uk <- boxGrob(label = paste("Subjects included in final analysis\n n = ", n[3]),
+                       x=midx, y=0.375, box_gp = gp, width = width))
+
+connectGrob(crit1.in_uk, crit2.in_uk, "v")
+
+(crit2.excl_uk <- boxGrob(label = paste("Country misreporting times\n n = ",n[2]-n[3]),
+                         x=rightx, y=mean(c(0.625,0.375)), box_gp = gp, width = width))
+
+connectGrob(crit1.in_uk, crit2.excl_uk, "-")
+
+pdf("Output_v3/fig1S1.pdf", width=10)
+grid.newpage()
+# set some parameters to use repeatedly
+leftx <- .3
+midx <- .5
+rightx <- .8
+width <- .25
+gp <- gpar(fill = "lightgrey")
+# create boxes
+(total_uk <- boxGrob(label = paste("Total\n n = ", n[1]),
+                    x=midx, y=.9, box_gp = gp, width = width))
+
+(crit1.in_uk <- boxGrob(label = paste("Remaining\n n = ", n[2]),
+                       x=midx, y=.625, box_gp = gp, width = width))
+
+connectGrob(total_uk, crit1.in_uk, "v")
+
+(crit1.excl_uk <- boxGrob(label = paste("Walk-in\n n = ",n[1]-n[2]),
+                         x=rightx, y=mean(c(0.9,0.625)), box_gp = gp, width = width))
+
+connectGrob(total_uk, crit1.excl_uk, "-")
+
+(crit2.in_uk <- boxGrob(label = paste("Subjects included in final analysis\n n = ", n[3]),
+                       x=midx, y=0.375, box_gp = gp, width = width))
+
+connectGrob(crit1.in_uk, crit2.in_uk, "v")
+
+(crit2.excl_uk <- boxGrob(label = paste("Country misreporting times\n n = ",n[2]-n[3]),
+                         x=rightx, y=mean(c(0.625,0.375)), box_gp = gp, width = width))
+
+connectGrob(crit1.in_uk, crit2.excl_uk, "-")
+dev.off()
+```
+
+Figure 1, a flowchart showing the inclusion in the analysis. Included patients came from `r sum(table(df$Subject.SiteCode)>0)` sites in `r sum(table(df$country)>0)` countries.
+
+## Figure 2 
+
+```{r}
+plot.cal_ost_impute
+pdf("Output_v3/fig2S1.pdf")
+plot.cal_ost_impute
+dev.off()
+
+```
+
+Figure 2, the concordance between predicted and observed on-scene time, in patients in whom the on-scene time was not missing. The performance of the linear mixed model was tested with this Figure. The R2 is a measure for the proportion of variance explained.
+
+## Table 1 
+
+```{r}
+colnames(resfig1) <- c("Variable", "Extra minutes (95% CI)")
+kable(resfig1)
+write.csv2(resfig1, "Output_v3/table1S1.csv", row.names=FALSE)
+
+```
+
+Table 1, absolute estimates and confidence intervals of Figure 1.
+
+## Table 2
+
+```{r}
+colnames(resfig2)[-1] <- paste(colnames(resfig2)[-1], ", OR (95% CI)", sep="")
+kable(resfig2)
+write.csv2(resfig2, "Output_v3/table2S1.csv", row.names=FALSE)
+```
+
+
+Table 2, absolute estimates and confidence intervals of Figure 2.
+
+## Figure 3
+
+```{r, fig.width=10}
+fit <- with(dfi$data[complete.cases(dfi$data),], 
+            lmer(onscene_t~Subject.Age+
+                         Subject.Sex+
+                         MEI+
+                         I(prehosp_t-sum(t1,onscene_t))+
+                         InjuryHx.PresEmergencyCareVentilation+
+                         InjuryHx.PresCirculationTreatmentIVFluids+
+                         InjuryHx.PresCirculationTreatmentCPR+
+                         InjuryHx.PresEmergencyCareIntubation+
+                         physician+
+                         InjuryHx.GCSScoreBaselineDerived+
+                         I(InjuryHx.PupilsBaselineDerived%in%c(1,2))+
+                         RTI+
+                         InjuryHx.PresTBIRef+
+                         (1|country/center))) 
+
+plot.df <- data.frame(estimate=unlist(c(coef(fit)[[1]][1,])),
+                      std.error=sqrt(diag(vcov(fit))))
+rownames(plot.df) <- names(unlist(c(coef(fit)[[1]][1,])))
+
+
+##age travt gcs (IQR)
+calc_iqr <- function(x){
+  lo <- quantile(x, na.rm=TRUE, probs=0.25)
+  hi <- quantile(x, na.rm=TRUE, probs=0.75)
+  range <- hi-lo
+  return(range)
+}
+plot.df["Subject.Age",
+        c("estimate", "std.error")] <- plot.df["Subject.Age",
+                                                c("estimate", "std.error")]*calc_iqr(df$Subject.Age)
+plot.df["InjuryHx.GCSScoreBaselineDerived",
+        c("estimate", "std.error")] <- plot.df["InjuryHx.GCSScoreBaselineDerived",
+                                                c("estimate", "std.error")]*calc_iqr(df$InjuryHx.GCSScoreBaselineDerived)
+plot.df["I(prehosp_t - sum(t1, onscene_t))",
+        c("estimate", "std.error")] <- plot.df["I(prehosp_t - sum(t1, onscene_t))",
+                                                c("estimate", "std.error")]*calc_iqr(df_toi$prehosp_t - apply(data.frame(df_toi$t1,                                                                            df_toi$onscene_t),                                                                                1,sum,na.rm=TRUE))
+
+plot.df$lo <- plot.df$estimate-1.96*plot.df$std.error
+plot.df$hi <- plot.df$estimate+1.96*plot.df$std.error
+
+plot.df$var <- rownames(plot.df)
+plot.df$var <- c("intect", "Age (IQR)", "Male", "MEI", "Traveltime (IQR)", 
+                 "Ventilation","IV fluids", "CPR","Prehospital intubation",
+                 "Physician at scene","GCS (IQR)", "Pupil(s) unreactive", "RTI", 
+                 "Secondary referral")
+plot.df <- plot.df[,c(1,3,4,5)]
+
+
+#add vargroup names
+vargroups <- data.frame(estimate=NA, lo=NA, hi=NA, var=c("Demographic             ",
+                                                         "Severity                ",
+                                                         "Situational             ",
+                                                         "Interventions           "))
+plot.df <- rbind(plot.df, vargroups)
+plot.df$var <- factor(plot.df$var, levels=c("Ventilation",
+                                            "CPR",
+                                            "IV fluids",
+                                            "Prehospital intubation",
+                                            "Interventions           ",
+                                            "RTI",
+                                            "Secondary referral",
+                                            "Physician at scene",
+                                            "Traveltime (IQR)",
+                                            "Situational             ",
+                                            "MEI",
+                                            "Pupil(s) unreactive",
+                                            "GCS (IQR)",
+                                            "Severity                ",
+                                            "Male",
+                                            "Age (IQR)",
+                                            "Demographic             ",
+                                            "intect"))
+
+plot_sarsapeff<-ggplot(plot.df[-1,], aes(x=var, y=estimate, ymin=lo, ymax=hi))+
+  geom_linerange(cex=2)+
+  geom_point(cex=3)+
+  theme_bw()+
+  geom_hline(yintercept = 0)+
+  ylab("Mean additional on-scene time (minutes)")+ 
+  theme(axis.text.x=element_text(size=16),
+        axis.text.y=element_text(size=16),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size=18))+
+  coord_flip()
+plot_sarsapeff
+
+pdf("Output_v3/fig3S1.pdf", widt=10)
+plot_sarsapeff
+dev.off()
+```
+
+Figure 3, a dot plot showing the independent effects on on-scene time of demographic factors, injury severity, situational factors, and interventions given. Only complete cases are included. The estimates can be interpreted as follows: this factor increases or decreasing the on-scene time by x minutes, independent of the other factors displayed. This is the result of a multivariable linear regression model. The coefficients (and 95% confidence intervals) of the model are displayed.  RTI, Road traffic incident; MEI, major extracranial injury; GCS, Glasgow Coma Scale; IQR, interquartile range; CPR, cardiopulmonary resuscitation; IV, intravenous.
+
+
+##Figure 4
+
+```{r, width=12}
+fithypot <- with(dfi$data, glm(InjuryHx.EDArrSBP<100~
+                         InjuryHx.PresCirculationTreatmentIVFluids+
+                           InjuryHx.PresEmergencyCareVentilation+
+                         MEI+
+                         InjuryHx.PresEmergencyCareIntubation+
+                         onscene_t+
+                         prehosp_t+
+                         InjuryHx.PupilsBaselineDerived+
+                         InjuryHx.GCSScoreBaselineDerived+
+                         Subject.Age+
+                         InjuryHx.PresTBIRef,  
+                         family="binomial"))
+fithypox <- with(dfi$data,glm(InjuryHx.EDArrSpO2<90~
+                         InjuryHx.PresCirculationTreatmentIVFluids+
+                           InjuryHx.PresEmergencyCareVentilation+
+                         MEI+
+                         InjuryHx.PresEmergencyCareIntubation+
+                         onscene_t+
+                         prehosp_t+
+                         InjuryHx.PupilsBaselineDerived+
+                         InjuryHx.GCSScoreBaselineDerived+
+                         Subject.Age+
+                         InjuryHx.PresTBIRef, family="binomial"))
+n1    <- table(df$InjuryHx.EDArrSBP<100)[2]
+beta1 <- fithypot$coefficients
+se1   <- sqrt(diag(vcov(fithypot)))
+n2    <- table(df$InjuryHx.EDArrSpO2<90)[2]
+beta2 <- fithypox$coefficients
+se2   <- sqrt(diag(vcov(fithypox)))
+
+names_coef <- names(fithypot$coefficients)
+names(beta1) <- names_coef
+names(se1)   <- names_coef
+names(beta2) <- names_coef
+names(se2)   <- names_coef
+
+for (i in c("onscene_t", "prehosp_t", "Subject.Age", "InjuryHx.GCSScoreBaselineDerived")){
+  beta1[i] <- beta1[i]*calc_iqr(df_toi[i])
+  beta2[i] <- beta2[i]*calc_iqr(df_toi[i])
+  se1[i] <- se1[i]*calc_iqr(df_toi[i])
+  se2[i] <- se2[i]*calc_iqr(df_toi[i])
+}
+
+
+plot.df <- data.frame(beta=c(beta1[-1], beta2[-1]),
+           se=c(se1[-1], se2[-1]),
+           outcome=c(rep("Hypotension (n=196)", length(beta1[-1])),
+                     rep("Hypoxia (n=96)", length(beta1[-1]))),
+           var=rep(c("IV fluids",
+                     "Ventilation",
+                     "MEI",
+                     "Intubation",
+                     "On-scene time (IQR)",
+                     "Prehospital time (IQR)",
+                     "One reactive pupil",
+                     "No reactive pupil",
+                     "GCS (IQR)",
+                     "Age (IQR)",
+                     "Secondary referral"),2))
+
+plot.df$var <- factor(plot.df$var, 
+                      levels=c("IV fluids",
+                     "Ventilation",
+                     "Intubation",
+                     "On-scene time (IQR)",
+                     "Prehospital time (IQR)",
+                     "Secondary referral",
+                     "One reactive pupil",
+                     "GCS (IQR)",
+                     "MEI",
+                     "No reactive pupil",
+                     "Age (IQR)"))
+
+plot_hypox_hypot<-ggplot(plot.df, aes(x=var, y=beta, ymin=beta-1.96*se, ymax=beta+1.96*se))+
+  geom_linerange(cex=2)+
+  geom_point(cex=3)+
+  theme_bw()+
+  geom_hline(yintercept = 0)+
+  ylab("Log(OR)")+ 
+  theme(axis.text.x=element_text(size=16),
+        axis.text.y=element_text(size=16),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size=18),
+        strip.text = element_text(size=18))+
+  coord_flip()+
+  facet_wrap(~outcome)
+plot_hypox_hypot
+
+pdf("Output_v3/fig4S1.pdf", width=12)
+plot_hypox_hypot
+dev.off()
+```
+
+Figure 4, the effect on hypotension (systolic blood pressure < 100 mmHg) or hypoxia (oxygen saturation < 90%) at arrival at the emergency department of demographic factors, injury severity, situational factors, and interventions given. Only complete cases are included.
+
+## Figure 5
+
+```{r, fig.width=10}
+
+fit_sec_insults <- fit.mult.impute(Subject.GOSE6monthEndpointDerived~
+                                 rcs(InjuryHx.EDArrSBP,3)+
+                                 rcs(InjuryHx.EDArrSpO2,3)+
+                                 Subject.Age+
+                                 InjuryHx.PupilsBaselineDerived+
+                                 InjuryHx.GCSScoreBaselineDerived+
+                                 Subject.PatientType+
+                                 InjuryHx.BestOfChestSpineISS+
+                                 InjuryHx.BestOfAbdomenPelvicLumbarISS+
+                                 InjuryHx.BestOfHeadBrainCervicalISS,
+                             fitter=lrm, 
+                             data=df_toi,
+                             xtrans=dfi,
+                             pr=FALSE)
+
+fit_sec_insults_null <- update(fit_sec_insults,
+                               formula=Subject.GOSE6monthEndpointDerived~
+                                 Subject.Age+
+                                 InjuryHx.PupilsBaselineDerived+
+                                 InjuryHx.GCSScoreBaselineDerived+
+                                 Subject.PatientType+
+                                 InjuryHx.BestOfChestSpineISS+
+                                 InjuryHx.BestOfAbdomenPelvicLumbarISS+
+                                 InjuryHx.BestOfHeadBrainCervicalISS)
+x2 <- -2*(as.numeric(logLik(fit_sec_insults_null))-as.numeric(logLik(fit_sec_insults)))
+
+nd <- with(df_toi, expand.grid(InjuryHx.EDArrSBP=seq(min(df$InjuryHx.EDArrSBP, na.rm=TRUE),
+                                                     max(df$InjuryHx.EDArrSBP, na.rm=TRUE),
+                                                     length.out = 50),
+                               InjuryHx.EDArrSpO2=seq(min(df$InjuryHx.EDArrSpO2, na.rm=TRUE),
+                                                     max(df$InjuryHx.EDArrSpO2, na.rm=TRUE),
+                                                     length.out = 50),
+                               Subject.Age=median(df$Subject.Age, na.rm=TRUE),
+                               InjuryHx.PupilsBaselineDerived=factor(0),
+                               InjuryHx.GCSScoreBaselineDerived=
+                                 median(df$InjuryHx.GCSScoreBaselineDerived, na.rm=TRUE),
+                               Subject.PatientType=factor("ICU"),
+                               InjuryHx.BestOfChestSpineISS=
+                                 median(df$InjuryHx.BestOfHeadBrainCervicalISS, na.rm=TRUE),
+                               InjuryHx.BestOfAbdomenPelvicLumbarISS=
+                                 median(df$InjuryHx.BestOfHeadBrainCervicalISS, na.rm=TRUE),
+                               InjuryHx.BestOfHeadBrainCervicalISS=
+                                 median(df$InjuryHx.BestOfHeadBrainCervicalISS, na.rm=TRUE)))
+
+nd$pred <- predict(fit_sec_insults, newdata=nd, se.fit = TRUE)$`linear.predictors`
+nd$se <- predict(fit_sec_insults, newdata=nd, se.fit = TRUE)$se.fit
+
+fig5s1_a <- ggplot(nd[nd$InjuryHx.EDArrSBP==nd$InjuryHx.EDArrSBP[nrow(nd)/2*1.5],], 
+       aes(x=InjuryHx.EDArrSpO2, 
+           y=pred, 
+           ymin=pred-1.96*se,
+           ymax=pred+1.96*se))+
+  geom_ribbon(alpha=0.5)+
+  xlab("Saturation at arrival (%)")+
+  ylab("Log-odds for a better functional outcome")+
+  geom_line()+
+  theme_bw()+
+  theme(text = element_text(size=16))
+fig5s1_b <- ggplot(nd[nd$InjuryHx.EDArrSpO2==nd$InjuryHx.EDArrSpO2[nrow(nd)/2*1.5],], 
+       aes(x=InjuryHx.EDArrSBP, 
+           y=pred, 
+           ymin=pred-1.96*se,
+           ymax=pred+1.96*se))+
+  geom_ribbon(alpha=0.5)+
+  xlab("Systolic blood pressure at arrival (mmHg)")+
+  ylab("Log-odds for a better functional outcome")+
+  geom_line()+
+  theme_bw()+
+  theme(text = element_text(size=16))
+
+bgravesteijn::multiplot(fig5s1_a, fig5s1_b, cols=2)
+pdf("Output_v3/fig5S1.pdf", width=10)
+bgravesteijn::multiplot(fig5s1_a, fig5s1_b, cols=2)
+dev.off()
+```
+
+Figure 5, the effect on saturation and systolic blood pressure at arrival on 6 months GOS-E. This was corrected for age, pupils, GCS, stratum, and injury severity (head/neck, abdominal, chest/spine components of the ISS). The grey bands represent 95% confidence intervals.  
+
