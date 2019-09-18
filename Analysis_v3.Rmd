@@ -36,8 +36,8 @@ df <- df[df$InjuryHx.PresArrivalMethod!="walk in"&
            !is.na(df$InjuryHx.PresArrivalMethod),]
 n[2] <- nrow(df)
 
-##remove denmark (small numbers, weird times)
-df <- df[df$country!="DK",]
+##remove ... (small numbers, weird times)
+df <- df[df$country!="...",]
 n[3] <- nrow(df)
 ```
 
