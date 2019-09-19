@@ -17,7 +17,7 @@ df.img <- data.frame(data.table(df.img)[,.(first(Imaging.SubduralHematomaSubacut
                                 first(Imaging.IntraventricularHemorrhage),
                                 first(Imaging.MassLesion)), by=gupi]) #take first one
 colnames(df.img) <- c("gupi", "sdmchron", "tsah", "edh", "sdhacute", "skullfrx","sdcolmixdens", "cistern", "midline", "intravhm", "mass")
-df <- merge(df, df.img, by="gupi")
+df <- merge(df, df.img, by="gupi", all.x=TRUE)
 
 ##categorize
 facvars<- colnames(df)[which(colnames(df)%in%c("InjuryHx.PresEmergencyServicePolice","InjuryHx.PresEmergencyServiceHelicopter",
