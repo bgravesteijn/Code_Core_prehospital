@@ -2,7 +2,9 @@
 title: "Version 2"
 author: "Benjamin Gravesteijn"
 date: "16 september 2019"
-output: html_document
+output:
+  html_document: default
+  word_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -36,12 +38,13 @@ df <- df[df$InjuryHx.PresArrivalMethod!="walk in"&
            !is.na(df$InjuryHx.PresArrivalMethod),]
 n[2] <- nrow(df)
 
-##remove ... (small numbers, weird times)
-df <- df[df$country!="...",]
+##remove denmark (small numbers, weird times)
+df <- df[df$country!="DK",]
 n[3] <- nrow(df)
 ```
 
 ```{r imputing on-scene times}
+set.seed(123)
 phtime <- df[,c("Subject.TimeInj", 
                 "Subject.DateInj",
                 "InjuryHx.PresFirstOnSceneDate",
@@ -217,16 +220,15 @@ vars     <- c("Subject.Age","Subject.Sex", "MEI",
               "InjuryHx.InjCause", "InjuryHx.InjType",
               "InjuryHx.InjArea", "InjuryHx.InjPlace", 
               "InjuryHx.PresEmergencyCare", "InjuryHx.PresTBIRef","InjuryHx.PresArrivalMethod",
-              "InjuryHx.GCSPreHospBestScore",
               "InjuryHx.GCSMotorBaselineDerived", "InjuryHx.GCSScoreBaselineDerived",
               "InjuryHx.PupilsBaselineDerived",
               "InjuryHx.PresCirculationTreatmentCPR", "InjuryHx.PresCirculationTreatmentIVFluids",
               "InjuryHx.PresEmergencyCareIntubation", "InjuryHx.PresEmergencyCareSuppOxygen",
-              "InjuryHx.PresEmergencyCareVentilation",
+              "InjuryHx.PresEmergencyCareVentilation","onscene_t",
               "response.time", "prehosp.time")
-numvar   <- c("Subject.Age","InjuryHx.GCSPreHospBestScore",
+numvar   <- c("Subject.Age",
               "InjuryHx.GCSMotorBaselineDerived", "InjuryHx.GCSScoreBaselineDerived",
-              "onscene_t", "arr.time", "prehosp.time", "response.time")
+              "onscene_t", "arr.time", "prehosp.time", "onscene_t","response.time")
 facvar   <- vars[-which(vars%in%numvar)]
 
 tbl1_sarsap   <- CreateTableOne(vars = vars, 
@@ -236,7 +238,8 @@ tbl1_sarsap   <- CreateTableOne(vars = vars,
 tbl1_sarsap.p <- print(tbl1_sarsap,
                      nonnorm=numvar,
                      missing=TRUE,
-                     printToggle=FALSE)
+                     printToggle=FALSE,
+                     contDigits=0)
 kable(tbl1_sarsap.p)
 write.csv2(tbl1_sarsap.p, file="Output_v3/table1.csv")
 
@@ -461,7 +464,7 @@ save(dfi, file = "Data/imputed.RData")
 
 ## Figure 1
 
-```{r, fig.width=10}
+```{r on-scene time effect, fig.width=10}
 load("Data/imputed.RData")
 load("Data/toimpute.RData")
 fit <- with(dfi, lmer(onscene_t~Subject.Age+
@@ -505,16 +508,16 @@ calc_iqr <- function(x){
 plot.df["Subject.Age",
         c("estimate", "std.error")] <- plot.df["Subject.Age",
                                                 c("estimate",
-                                                  "std.error")]*calc_iqr(df$Subject.Age)
+                                                  "std.error")]*calc_iqr(dfi$data$Subject.Age)
 plot.df["InjuryHx.GCSScoreBaselineDerived",
         c("estimate", "std.error")] <- plot.df["InjuryHx.GCSScoreBaselineDerived",
                                                 c("estimate",
                                                   "std.error")]* calc_iqr(
-                                                    df$InjuryHx.GCSScoreBaselineDerived)
+                                                    dfi$data$InjuryHx.GCSScoreBaselineDerived)
 plot.df["traveltime",
         c("estimate", "std.error")] <- plot.df["traveltime",
                                                 c("estimate",
-                                                  "std.error")]*calc_iqr(df$traveltime)
+                                                  "std.error")]*calc_iqr(dfi$data$traveltime)
 
 plot.df$lo <- plot.df$estimate-1.96*plot.df$std.error
 plot.df$hi <- plot.df$estimate+1.96*plot.df$std.error
@@ -598,7 +601,7 @@ Figure 1, a dot plot showing the independent effects on on-scene time of demogra
 
 ## Figure 2
 
-```{r, fig.width=10}
+```{r instability effect, fig.width=10}
 fithypot <- with(dfi, glm(InjuryHx.EDArrSBP<100~
                          InjuryHx.PresCirculationTreatmentIVFluids+
                            InjuryHx.PresEmergencyCareVentilation+
@@ -606,7 +609,7 @@ fithypot <- with(dfi, glm(InjuryHx.EDArrSBP<100~
                          InjuryHx.PresEmergencyCareIntubation+
                          onscene_t+
                          prehosp_t+
-                         InjuryHx.PupilsBaselineDerived+
+                         I(InjuryHx.PupilsBaselineDerived%in%c(1,2))+
                          InjuryHx.GCSScoreBaselineDerived+
                          Subject.Age+
                          InjuryHx.PresTBIRef,  
@@ -618,7 +621,7 @@ fithypox <- with(dfi,glm(InjuryHx.EDArrSpO2<90~
                          InjuryHx.PresEmergencyCareIntubation+
                          onscene_t+
                          prehosp_t+
-                         InjuryHx.PupilsBaselineDerived+
+                         I(InjuryHx.PupilsBaselineDerived%in%c(1,2))+
                          InjuryHx.GCSScoreBaselineDerived+
                          Subject.Age+
                          InjuryHx.PresTBIRef, family="binomial"))
@@ -645,16 +648,15 @@ for (i in c("onscene_t", "prehosp_t", "Subject.Age", "InjuryHx.GCSScoreBaselineD
 
 plot.df <- data.frame(beta=c(beta1[-1], beta2[-1]),
            se=c(se1[-1], se2[-1]),
-           outcome=c(rep("Hypotension (n=196)", length(beta1[-1])),
-                     rep("Hypoxia (n=96)", length(beta1[-1]))),
+           outcome=c(rep("Hypotension", length(beta1[-1])),
+                     rep("Hypoxia", length(beta1[-1]))),
            var=rep(c("IV fluids",
                      "Ventilation",
                      "MEI",
                      "Intubation",
                      "On-scene time (IQR)",
                      "Prehospital time (IQR)",
-                     "One reactive pupil",
-                     "No reactive pupil",
+                     "No reactive pupil(s)",
                      "GCS (IQR)",
                      "Age (IQR)",
                      "Secondary referral"),2))
@@ -667,8 +669,7 @@ plot.df$var <- factor(plot.df$var,
                      "Prehospital time (IQR)",
                      "Secondary referral",
                      "MEI",
-                     "No reactive pupil",
-                     "One reactive pupil",
+                     "No reactive pupil(s)",
                      "GCS (IQR)",
                      "Age (IQR)"))
 
@@ -712,7 +713,7 @@ Figure 2, the effect on hypotension (systolic blood pressure < 100 mmHg) or hypo
 
 ```{r, fig.width=10}
 figure3
-pdf("Output_v3/fig3.pdf")
+pdf("Output_v3/fig3.pdf", width=10)
 figure3
 dev.off()
 ```
@@ -721,7 +722,7 @@ Figure 3, a bar chart showing the time spent in different prehospital phases per
 
 ## Figure 4
 
-```{r, fig.width=40, fig.height=24}
+```{r maps variation, fig.width=40, fig.height=24}
 
 #######on scene time
 fit_ost <- with(dfi, lmer(onscene_t~ 
@@ -1116,7 +1117,7 @@ Figure 4, the adjusted variation in prehospital time (upper row), and use of key
 
 ## Figure 5
 
-```{r, fig.height=8}
+```{r ppanalysis, fig.height=8}
 pp <- readxl::read_excel("Data/Q3_18.07.2016.xlsx")
 pp$SceneTraumaPolicy <- factor(pp$SceneTraumaPolicy)
 levels(pp$SceneTraumaPolicy) <- c("Scoop and run", "Mostly Scoop and run", "Mostly Stay and play", "Stay and play", NA)
@@ -1227,7 +1228,7 @@ Figure 5, the unadjusted and adjusted log transformed median on-scene times. The
 
 ## Figure 1 
 
-```{r, fig.width=10}
+```{r flowchart, fig.width=10}
 grid.newpage()
 # set some parameters to use repeatedly
 leftx <- .3
@@ -1437,7 +1438,7 @@ fithypot <- with(dfi$data, glm(InjuryHx.EDArrSBP<100~
                          InjuryHx.PresEmergencyCareIntubation+
                          onscene_t+
                          prehosp_t+
-                         InjuryHx.PupilsBaselineDerived+
+                         I(InjuryHx.PupilsBaselineDerived%in%c(1,2))+
                          InjuryHx.GCSScoreBaselineDerived+
                          Subject.Age+
                          InjuryHx.PresTBIRef,  
@@ -1449,7 +1450,7 @@ fithypox <- with(dfi$data,glm(InjuryHx.EDArrSpO2<90~
                          InjuryHx.PresEmergencyCareIntubation+
                          onscene_t+
                          prehosp_t+
-                         InjuryHx.PupilsBaselineDerived+
+                         I(InjuryHx.PupilsBaselineDerived%in%c(1,2))+
                          InjuryHx.GCSScoreBaselineDerived+
                          Subject.Age+
                          InjuryHx.PresTBIRef, family="binomial"))
@@ -1476,16 +1477,15 @@ for (i in c("onscene_t", "prehosp_t", "Subject.Age", "InjuryHx.GCSScoreBaselineD
 
 plot.df <- data.frame(beta=c(beta1[-1], beta2[-1]),
            se=c(se1[-1], se2[-1]),
-           outcome=c(rep("Hypotension (n=196)", length(beta1[-1])),
-                     rep("Hypoxia (n=96)", length(beta1[-1]))),
+           outcome=c(rep("Hypotension", length(beta1[-1])),
+                     rep("Hypoxia", length(beta1[-1]))),
            var=rep(c("IV fluids",
                      "Ventilation",
                      "MEI",
                      "Intubation",
                      "On-scene time (IQR)",
                      "Prehospital time (IQR)",
-                     "One reactive pupil",
-                     "No reactive pupil",
+                     "No reactive pupil(s)",
                      "GCS (IQR)",
                      "Age (IQR)",
                      "Secondary referral"),2))
@@ -1497,10 +1497,9 @@ plot.df$var <- factor(plot.df$var,
                      "On-scene time (IQR)",
                      "Prehospital time (IQR)",
                      "Secondary referral",
-                     "One reactive pupil",
-                     "GCS (IQR)",
                      "MEI",
-                     "No reactive pupil",
+                     "No reactive pupil(s)",
+                     "GCS (IQR)",
                      "Age (IQR)"))
 
 plot_hypox_hypot<-ggplot(plot.df, aes(x=var, y=beta, ymin=beta-1.96*se, ymax=beta+1.96*se))+
